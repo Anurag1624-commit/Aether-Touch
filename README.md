@@ -1,5 +1,5 @@
 # Aether-Touch 🖐️🔊
-Real-Time Gesture-Controlled Volume Interface
+Real-Time Gesture-Controlled Interface
 
 Aether-Touch is a computer vision-based application that allows users to control their system volume using hand gestures. By leveraging MediaPipe's neural networks for hand landmark detection and OpenCV for real-time video processing, it transforms "thin air" into a functional, touchless controller.
 
