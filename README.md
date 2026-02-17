@@ -35,4 +35,5 @@ pip install opencv-python mediapipe numpy pycaw
 # Run the application:
 python main.py
 # File: 
-[mouse_control_using _hand.py](https://github.com/user-attachments/files/25282481/mouse_control_using._hand.py)
+[mouse_control_using _hand.py](https://github.com/user-attachments/files/25368203/mouse_control_using._hand.py)
+
