@@ -1,103 +1,893 @@
-import cv2
-import mediapipe
-import pyautogui
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║           GESTURE CONTROLLED SYSTEM — Windows Edition                       ║
+║           Real-time Hand Gesture Mouse, Scroll & Volume Control             ║
+║           Built with MediaPipe, OpenCV, PyAutoGUI & Pycaw                   ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+REQUIRED LIBRARIES (install via pip):
+    pip install opencv-python mediapipe pyautogui pycaw numpy comtypes
+
+USAGE:
+    python gesture_control_system.py
+
+GESTURE GUIDE:
+    ┌─────────────────┬──────────────────────────────────────────────────┐
+    │ Gesture         │ Action                                           │
+    ├─────────────────┼──────────────────────────────────────────────────┤
+    │ Index finger up │ Move cursor (Mouse Mode)                         │
+    │ Pinch I+Thumb   │ Left Click                                       │
+    │ Pinch M+Thumb   │ Right Click                                      │
+    │ Index+Middle up │ Arm auto-scroll (hold steady 8 frames)           │
+    │ Hand UP/DOWN    │ Auto-scroll — distance from neutral = speed       │
+    │ Fist            │ Stop auto-scroll immediately                      │
+    │ Thumb+Index     │ Volume Mode — spread apart/together to change    │
+    │ 3 Fingers up    │ Switch between Mouse → Scroll → Volume modes     │
+    │ Press 'Q'       │ Quit the application                             │
+    └─────────────────┴──────────────────────────────────────────────────┘
+"""
+
+# ─── Standard Library ──────────────────────────────────────────────────────────
 import math
+import time
 
-# Initialize mediapipe
-capture_hands = mediapipe.solutions.hands.Hands()
-drawing_option = mediapipe.solutions.drawing_utils
+# ─── Third-Party Libraries ─────────────────────────────────────────────────────
+import cv2
+import mediapipe as mp
+import numpy as np
+import pyautogui
 
-# Screen size
-screen_width, screen_height = pyautogui.size()
-
-# Camera
-camera = cv2.VideoCapture(0)
-
-# Landmark positions
-x1 = y1 = x2 = y2 = x3 = y3 = 0
-
-# Click control flags
-clicking = False
-right_clicking = False
-
-# Cursor smoothing
-plocX, plocY = 0, 0
-clocX, clocY = 0, 0
-smoothening = 6
+# ─── Windows Volume Control (Pycaw) ────────────────────────────────────────────
+try:
+    from ctypes import cast, POINTER
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    PYCAW_AVAILABLE = True
+except ImportError:
+    PYCAW_AVAILABLE = False
+    print("[WARNING] pycaw not found. Volume control will be disabled.")
+    print("          Install with: pip install pycaw comtypes")
 
 
-while True:
-    _, image = camera.read()
-    image = cv2.flip(image, 1)
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION — Tweak these values to suit your environment
+# ══════════════════════════════════════════════════════════════════════════════
 
-    image_height, image_width, _ = image.shape
-    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+class Config:
+    # ── Camera ────────────────────────────────────────────────────────────────
+    CAM_INDEX       = 0          # Webcam index (0 = default)
+    CAM_WIDTH       = 640        # Camera frame width
+    CAM_HEIGHT      = 480        # Camera frame height
+    FLIP_CAMERA     = True       # Mirror the feed (natural feel)
 
-    output_hands = capture_hands.process(rgb_image)
-    all_hands = output_hands.multi_hand_landmarks
+    # ── Cursor Smoothing ──────────────────────────────────────────────────────
+    SMOOTHING       = 5          # Higher = smoother but more lag (3–10 range)
 
-    if all_hands:
-        for hand in all_hands:
+    # ── Screen Mapping — shrink the active zone for easier control ────────────
+    FRAME_REDUCTION = 100        # Pixels to crop from each edge of frame
 
-            drawing_option.draw_landmarks(image, hand)
-            one_hand_landmarks = hand.landmark
+    # ── Click Detection ───────────────────────────────────────────────────────
+    CLICK_THRESHOLD      = 35    # Pixel distance to trigger a click
+    CLICK_COOLDOWN       = 0.4   # Seconds between allowed clicks
 
-            for id, lm in enumerate(one_hand_landmarks):
+    # ── Scroll Control ────────────────────────────────────────────────────────
+    SCROLL_THRESHOLD      = 45   # Max px gap between index+middle to count as "2 fingers up"
+    SCROLL_ARM_FRAMES     = 8    # Frames hand must be steady before auto-scroll arms
+    SCROLL_DEAD_ZONE      = 18   # Pixels from neutral centre — no scroll in this band
+    SCROLL_SLOW_ZONE      = 45   # Pixels from neutral — slow scroll speed
+    SCROLL_FAST_ZONE      = 90   # Pixels from neutral — fast scroll speed
+    SCROLL_SPEED_SLOW     = 2    # pyautogui scroll units per frame (slow zone)
+    SCROLL_SPEED_MED      = 5    # pyautogui scroll units per frame (medium zone)
+    SCROLL_SPEED_FAST     = 10   # pyautogui scroll units per frame (fast zone)
 
-                x = int(lm.x * image_width)
-                y = int(lm.y * image_height)
+    # ── Volume Control ────────────────────────────────────────────────────────
+    VOL_MIN_DIST        = 30     # Finger distance (px) = 0% volume
+    VOL_MAX_DIST        = 180    # Finger distance (px) = 100% volume
+    VOL_ACTIVATE_DIST   = 60     # Pinch tighter than this to UNLOCK volume control
+    VOL_DEACTIVATE_DIST = 80     # Open wider than this to LOCK (stop changing volume)
+    VOL_STEP            = 2      # Snap volume to nearest N% — feels like real buttons
+    VOL_SMOOTHING       = 6      # Higher = slower/smoother volume response (3–10)
 
-                # INDEX FINGER (Cursor Movement)
-                if id == 8:
-                    mouse_x = int(screen_width / image_width * x)
-                    mouse_y = int(screen_height / image_height * y)
+    # ── Mode Switching ────────────────────────────────────────────────────────
+    MODE_SWITCH_COOLDOWN = 1.2   # Seconds before another mode switch is allowed
 
-                    # Smoothing
-                    clocX = plocX + (mouse_x - plocX) / smoothening
-                    clocY = plocY + (mouse_y - plocY) / smoothening
+    # ── UI ────────────────────────────────────────────────────────────────────
+    UI_COLOR_ACCENT      = (0,   220, 180)   # Teal accent
+    UI_COLOR_WARN        = (0,   80,  255)   # Orange/red warning
+    UI_COLOR_TEXT        = (240, 240, 240)   # Near-white text
+    UI_COLOR_BG          = (20,  20,  25)    # Dark panel background
+    UI_COLOR_SUCCESS     = (80,  230, 100)   # Green for success states
 
-                    pyautogui.moveTo(clocX, clocY)
 
-                    plocX, plocY = clocX, clocY
+# ══════════════════════════════════════════════════════════════════════════════
+#  UTILITY FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════
 
-                    x1, y1 = x, y
-                    cv2.circle(image, (x, y), 10, (0, 255, 255), -1)
+def euclidean_distance(p1, p2):
+    """Return Euclidean distance between two (x, y) landmark points."""
+    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
-                # THUMB (Left Click)
-                if id == 4:
-                    x2, y2 = x, y
-                    cv2.circle(image, (x, y), 10, (0, 255, 255), -1)
 
-                # MIDDLE FINGER (Right Click)
-                if id == 12:
-                    x3, y3 = x, y
-                    cv2.circle(image, (x,y), 10, (255, 0 , 255), -1)
-                dist = math.hypot(x2 - x1, y2 - y1)
+def smooth_value(prev, current, factor):
+    """
+    Exponential moving average for smoothing cursor jitter.
+    Formula: smooth = prev + (current - prev) / factor
+    """
+    return prev + (current - prev) / factor
 
-        if dist < 30:
-            if not clicking:
-                pyautogui.click()
-                clicking = True
+
+def landmark_to_pixel(landmark, frame_w, frame_h):
+    """Convert normalised MediaPipe landmark to pixel coordinates."""
+    return int(landmark.x * frame_w), int(landmark.y * frame_h)
+
+
+def draw_rounded_rect(img, pt1, pt2, color, radius=10, thickness=-1, alpha=0.6):
+    """Draw a semi-transparent rounded rectangle on img (in-place)."""
+    overlay = img.copy()
+    x1, y1 = pt1
+    x2, y2 = pt2
+    r = radius
+
+    # Draw main rect minus corners
+    cv2.rectangle(overlay, (x1 + r, y1), (x2 - r, y2), color, thickness)
+    cv2.rectangle(overlay, (x1, y1 + r), (x2, y2 - r), color, thickness)
+
+    # Four corner circles
+    for cx, cy in [(x1+r, y1+r), (x2-r, y1+r), (x1+r, y2-r), (x2-r, y2-r)]:
+        cv2.circle(overlay, (cx, cy), r, color, thickness)
+
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+
+
+def count_raised_fingers(landmarks, frame_w, frame_h):
+    """
+    Count how many fingers are raised.
+    Returns a list of booleans: [thumb, index, middle, ring, pinky]
+    Uses tip-vs-pip comparison for fingers; thumb uses x-axis logic.
+    """
+    tips  = [4, 8, 12, 16, 20]  # Tip landmark indices
+    pips  = [3, 6, 10, 14, 18]  # PIP (proximal) landmark indices
+    raised = []
+
+    # Thumb — compare x-coordinate (works for right hand facing camera)
+    thumb_tip = landmark_to_pixel(landmarks[4], frame_w, frame_h)
+    thumb_ip  = landmark_to_pixel(landmarks[3], frame_w, frame_h)
+    raised.append(thumb_tip[0] < thumb_ip[0])  # True if thumb is to the left
+
+    # Other four fingers — tip y < pip y means finger is up
+    for tip_idx, pip_idx in zip(tips[1:], pips[1:]):
+        tip = landmark_to_pixel(landmarks[tip_idx], frame_w, frame_h)
+        pip = landmark_to_pixel(landmarks[pip_idx], frame_w, frame_h)
+        raised.append(tip[1] < pip[1])
+
+    return raised  # [thumb, index, middle, ring, pinky]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  VOLUME CONTROLLER  (Windows only via Pycaw)
+#  Controls BOTH master volume AND all active app audio sessions (Chrome, VLC,
+#  media players, etc.) so gesture volume affects everything including videos.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class VolumeController:
+    """
+    Dual-layer Windows volume control:
+      Layer 1 — Master endpoint volume (the system tray slider)
+      Layer 2 — All active application audio sessions (Chrome, Edge, VLC, etc.)
+
+    Both layers are set together on every change so videos and system sounds
+    all respond to the gesture at the same time.
+    """
+
+    def __init__(self):
+        self.enabled          = PYCAW_AVAILABLE
+        self.master_interface = None   # IAudioEndpointVolume for master
+        self._last_set_pct    = -1     # Last pct sent to avoid redundant API calls
+        self.current_pct      = 50     # Internal tracked value
+
+        if self.enabled:
+            try:
+                # ── Master volume interface ───────────────────────────────────
+                devices = AudioUtilities.GetSpeakers()
+                interface = devices.Activate(
+                    IAudioEndpointVolume._iid_, CLSCTX_ALL, None
+                )
+                self.master_interface = cast(interface, POINTER(IAudioEndpointVolume))
+
+                # Read actual system volume once at startup
+                scalar = self.master_interface.GetMasterVolumeLevelScalar()
+                self.current_pct   = int(scalar * 100)
+                self._last_set_pct = self.current_pct
+                print(f"[INFO]  Volume controller ready. Current volume: {self.current_pct}%")
+
+            except Exception as e:
+                print(f"[WARNING] Could not initialise volume controller: {e}")
+                self.enabled = False
+
+    def _set_all_session_volumes(self, scalar):
+        """
+        Walk every active Windows audio session and set its volume to scalar.
+        This covers Chrome, Edge, Firefox, VLC, Spotify, Windows Media Player,
+        and any other app currently playing audio.
+        Sessions are fetched fresh each call so newly opened apps are included.
+        """
+        try:
+            sessions = AudioUtilities.GetAllSessions()
+            for session in sessions:
+                try:
+                    # Only touch sessions that are actively playing (State=1)
+                    # or at minimum have a valid SimpleAudioVolume interface
+                    volume = session.SimpleAudioVolume
+                    if volume is not None:
+                        volume.SetMasterVolume(scalar, None)
+                except Exception:
+                    pass   # Skip sessions that don't support volume control
+        except Exception as e:
+            print(f"[WARNING] Session volume set failed: {e}")
+
+    def set_volume_percent(self, pct):
+        """
+        Set volume to pct (0–100) on BOTH master endpoint and all app sessions.
+        Snaps to nearest VOL_STEP for a deliberate button-like feel.
+        Only issues API calls when the stepped value actually changes.
+        """
+        # Clamp and step-snap
+        pct         = max(0, min(100, int(pct)))
+        step        = Config.VOL_STEP
+        stepped_pct = int(round(pct / step) * step)
+        stepped_pct = max(0, min(100, stepped_pct))
+
+        # Always update internal tracker
+        self.current_pct = stepped_pct
+
+        if not self.enabled:
+            return stepped_pct   # No pycaw — UI still responds visually
+
+        # Skip Windows API calls if value hasn't changed
+        if stepped_pct == self._last_set_pct:
+            return stepped_pct
+
+        scalar = stepped_pct / 100.0
+
+        # ── Layer 1: master endpoint (system tray slider) ─────────────────────
+        try:
+            self.master_interface.SetMasterVolumeLevelScalar(scalar, None)
+        except Exception as e:
+            print(f"[WARNING] Master volume set failed: {e}")
+
+        # ── Layer 2: all app audio sessions (videos, music players, etc.) ─────
+        self._set_all_session_volumes(scalar)
+
+        self._last_set_pct = stepped_pct
+        return stepped_pct
+
+    def get_current_volume_percent(self):
+        """
+        Return current volume percentage from internal tracker.
+        Never polls Windows API mid-frame — zero overhead.
+        """
+        return self.current_pct
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UI OVERLAY RENDERER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class UIRenderer:
+    """All OpenCV drawing logic for the on-screen HUD."""
+
+    MODES = ["MOUSE", "SCROLL", "VOLUME"]
+    MODE_COLORS = {
+        "MOUSE":  (0, 220, 180),
+        "SCROLL": (0, 170, 255),
+        "VOLUME": (255, 170, 0),
+    }
+    FONT       = cv2.FONT_HERSHEY_SIMPLEX
+    FONT_BOLD  = cv2.FONT_HERSHEY_DUPLEX
+
+    def __init__(self, frame_w, frame_h):
+        self.w = frame_w
+        self.h = frame_h
+
+    # ── Top-left info panel ───────────────────────────────────────────────────
+    def draw_info_panel(self, frame, fps, mode, gesture_label):
+        panel_h = 110
+        draw_rounded_rect(frame, (10, 10), (220, panel_h), Config.UI_COLOR_BG, radius=12, alpha=0.65)
+
+        mode_color = self.MODE_COLORS.get(mode, Config.UI_COLOR_ACCENT)
+
+        # FPS
+        cv2.putText(frame, f"FPS: {fps:.0f}", (22, 38),
+                    self.FONT, 0.55, Config.UI_COLOR_TEXT, 1, cv2.LINE_AA)
+
+        # Active mode badge
+        cv2.putText(frame, "MODE:", (22, 62),
+                    self.FONT, 0.48, Config.UI_COLOR_TEXT, 1, cv2.LINE_AA)
+        cv2.putText(frame, mode, (80, 62),
+                    self.FONT_BOLD, 0.55, mode_color, 1, cv2.LINE_AA)
+
+        # Gesture label
+        cv2.putText(frame, f"Gesture: {gesture_label}", (22, 88),
+                    self.FONT, 0.45, Config.UI_COLOR_TEXT, 1, cv2.LINE_AA)
+
+    # ── Volume bar (right side) ───────────────────────────────────────────────
+    def draw_volume_bar(self, frame, volume_pct, vol_active=False):
+        bar_x, bar_y  = self.w - 52, 75
+        bar_h         = 260
+        bar_w         = 24
+        filled        = int(bar_h * volume_pct / 100)
+
+        # Background panel
+        draw_rounded_rect(frame,
+                          (bar_x - 8, bar_y - 22),
+                          (bar_x + bar_w + 8, bar_y + bar_h + 30),
+                          Config.UI_COLOR_BG, radius=10, alpha=0.70)
+
+        # Empty track
+        cv2.rectangle(frame, (bar_x, bar_y),
+                      (bar_x + bar_w, bar_y + bar_h), (45, 45, 45), -1)
+
+        # Filled portion — green at low, yellow mid, red at high
+        if filled > 0:
+            r = int(255 * volume_pct / 100)
+            g = int(220 * (1 - volume_pct / 100))
+            fill_color = (0, g, r)
+            cv2.rectangle(frame,
+                          (bar_x, bar_y + bar_h - filled),
+                          (bar_x + bar_w, bar_y + bar_h),
+                          fill_color, -1)
+
+        # Step marker lines at 25 / 50 / 75%
+        for marker_pct in [25, 50, 75]:
+            marker_y = bar_y + bar_h - int(bar_h * marker_pct / 100)
+            cv2.line(frame,
+                     (bar_x - 3, marker_y),
+                     (bar_x + bar_w + 3, marker_y),
+                     (180, 180, 180), 1)
+            cv2.putText(frame, f"{marker_pct}",
+                        (bar_x - 22, marker_y + 4),
+                        self.FONT, 0.32, (150, 150, 150), 1, cv2.LINE_AA)
+
+        # Border — glows cyan when active, dim when locked
+        border_color = (0, 220, 180) if vol_active else (70, 70, 70)
+        cv2.rectangle(frame, (bar_x, bar_y),
+                      (bar_x + bar_w, bar_y + bar_h), border_color, 2)
+
+        # Percentage label
+        cv2.putText(frame, f"{volume_pct}%",
+                    (bar_x - 6, bar_y + bar_h + 18),
+                    self.FONT, 0.50, Config.UI_COLOR_TEXT, 1, cv2.LINE_AA)
+
+        # Title with lock/active icon
+        icon  = "VOL" if not vol_active else "VOL*"
+        color = Config.UI_COLOR_ACCENT if vol_active else (130, 130, 130)
+        cv2.putText(frame, icon,
+                    (bar_x, bar_y - 8),
+                    self.FONT, 0.45, color, 1, cv2.LINE_AA)
+
+    # ── Active zone border ────────────────────────────────────────────────────
+    def draw_active_zone(self, frame):
+        fr = Config.FRAME_REDUCTION
+        cv2.rectangle(frame,
+                      (fr, fr),
+                      (self.w - fr, self.h - fr),
+                      (50, 50, 50), 1)
+
+    # ── Click flash indicator ─────────────────────────────────────────────────
+    def draw_click_flash(self, frame, click_type):
+        color = Config.UI_COLOR_SUCCESS if click_type == "LEFT" else Config.UI_COLOR_WARN
+        label = f"{click_type} CLICK"
+        cv2.putText(frame, label,
+                    (self.w // 2 - 60, self.h - 30),
+                    self.FONT_BOLD, 0.8, color, 2, cv2.LINE_AA)
+
+    # ── Mode-switch flash ─────────────────────────────────────────────────────
+    def draw_mode_switch_flash(self, frame, new_mode):
+        color = self.MODE_COLORS.get(new_mode, Config.UI_COLOR_ACCENT)
+        label = f"→  {new_mode} MODE"
+        cv2.putText(frame, label,
+                    (self.w // 2 - 100, self.h // 2),
+                    self.FONT_BOLD, 1.1, color, 2, cv2.LINE_AA)
+
+    # ── Bottom gesture guide strip ────────────────────────────────────────────
+    def draw_help_strip(self, frame):
+        help_y = self.h - 12
+        hints  = "Q=Quit  |  3 Fingers=Switch Mode  |  Pinch I=LClick  |  Pinch M=RClick"
+        cv2.putText(frame, hints, (10, help_y),
+                    self.FONT, 0.38, (120, 120, 120), 1, cv2.LINE_AA)
+
+    # ── Finger distance indicator line ────────────────────────────────────────
+    def draw_distance_line(self, frame, p1, p2, distance, color=None):
+        color = color or Config.UI_COLOR_ACCENT
+        cv2.line(frame, p1, p2, color, 2)
+        mid   = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
+        cv2.circle(frame, mid, 5, color, -1)
+        cv2.putText(frame, f"{int(distance)}px", (mid[0] + 8, mid[1]),
+                    self.FONT, 0.42, color, 1, cv2.LINE_AA)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GESTURE CONTROLLER  — core logic
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GestureController:
+    """
+    Main controller that ties together:
+      - MediaPipe hand tracking
+      - Cursor movement with smoothing
+      - Left / right click detection
+      - Scroll control
+      - Volume control
+      - Mode switching
+    """
+
+    MODES = ["MOUSE", "SCROLL", "VOLUME"]
+
+    def __init__(self):
+        # ── Screen info ───────────────────────────────────────────────────────
+        pyautogui.FAILSAFE = False   # Disable corner failsafe during gesture use
+        self.screen_w, self.screen_h = pyautogui.size()
+
+        # ── State ─────────────────────────────────────────────────────────────
+        self.mode_index      = 0     # 0=MOUSE, 1=SCROLL, 2=VOLUME
+        self.prev_x          = 0
+        self.prev_y          = 0
+        self.scroll_ref_y    = None  # Neutral Y anchor captured when arming
+        self.scroll_speed    = 0     # Current auto-scroll speed (signed, +up/-down)
+        self.scroll_armed    = False # True = auto-scroll is running
+        self.scroll_arm_counter = 0  # Counts steady frames before arming
+        self.volume_pct      = 50    # Displayed volume %
+        self.gesture_label   = "None"
+
+        # ── Cooldown timestamps ───────────────────────────────────────────────
+        self.last_left_click   = 0.0
+        self.last_right_click  = 0.0
+        self.last_mode_switch  = 0.0
+        self.click_flash_until = 0.0
+        self.click_flash_type  = ""
+        self.mode_flash_until  = 0.0
+        self.mode_flash_label  = ""
+
+        # ── Sub-modules ───────────────────────────────────────────────────────
+        self.vol_ctrl        = VolumeController()
+        self.volume_pct      = self.vol_ctrl.current_pct   # Use value read at startup, not a new poll
+        self.smooth_vol_dist = 100.0   # Smoothed distance for volume — avoids jitter
+        self.vol_active      = False   # Pinch-lock: True = actively adjusting volume
+
+    @property
+    def mode(self):
+        return self.MODES[self.mode_index]
+
+    # ── Switch to next mode cyclically ───────────────────────────────────────
+    def switch_mode(self):
+        now = time.time()
+        if now - self.last_mode_switch < Config.MODE_SWITCH_COOLDOWN:
+            return
+        self.last_mode_switch = now
+        self.mode_index = (self.mode_index + 1) % len(self.MODES)
+        self.scroll_ref_y       = None   # Reset scroll anchor on mode change
+        self.scroll_armed       = False  # Reset auto-scroll on mode change
+        self.scroll_arm_counter = 0
+        self.scroll_speed       = 0
+        self.vol_active         = False  # Reset volume lock on mode change
+        self.mode_flash_label = self.mode
+        self.mode_flash_until = now + 0.9
+        print(f"[MODE] Switched to {self.mode}")
+
+    # ── Cursor control (MOUSE mode) ───────────────────────────────────────────
+    def handle_mouse_mode(self, landmarks, frame_w, frame_h, frame, ui):
+        """Move cursor using index finger tip with smoothing."""
+        fr   = Config.FRAME_REDUCTION
+        tip  = landmark_to_pixel(landmarks[8], frame_w, frame_h)   # Index tip
+        tip2 = landmark_to_pixel(landmarks[12], frame_w, frame_h)  # Middle tip
+        thumb= landmark_to_pixel(landmarks[4], frame_w, frame_h)
+
+        # Draw fingertip marker
+        cv2.circle(frame, tip, 10, Config.UI_COLOR_ACCENT, -1)
+
+        # Map from active zone to screen coordinates
+        mapped_x = np.interp(tip[0], (fr, frame_w - fr), (0, self.screen_w))
+        mapped_y = np.interp(tip[1], (fr, frame_h - fr), (0, self.screen_h))
+
+        # Smooth
+        smooth_x = smooth_value(self.prev_x, mapped_x, Config.SMOOTHING)
+        smooth_y = smooth_value(self.prev_y, mapped_y, Config.SMOOTHING)
+        self.prev_x, self.prev_y = smooth_x, smooth_y
+
+        pyautogui.moveTo(smooth_x, smooth_y)
+        self.gesture_label = "Cursor Move"
+
+        # ── Left Click: thumb ↔ index finger pinch ────────────────────────────
+        left_dist = euclidean_distance(thumb, tip)
+        ui.draw_distance_line(frame, thumb, tip, left_dist, (100, 255, 100))
+        now = time.time()
+        if left_dist < Config.CLICK_THRESHOLD and (now - self.last_left_click) > Config.CLICK_COOLDOWN:
+            pyautogui.click()
+            self.last_left_click   = now
+            self.click_flash_type  = "LEFT"
+            self.click_flash_until = now + 0.35
+            self.gesture_label     = "Left Click"
+
+        # ── Right Click: thumb ↔ middle finger pinch ──────────────────────────
+        right_dist = euclidean_distance(thumb, tip2)
+        ui.draw_distance_line(frame, thumb, tip2, right_dist, (255, 100, 100))
+        if right_dist < Config.CLICK_THRESHOLD and (now - self.last_right_click) > Config.CLICK_COOLDOWN:
+            pyautogui.rightClick()
+            self.last_right_click  = now
+            self.click_flash_type  = "RIGHT"
+            self.click_flash_until = now + 0.35
+            self.gesture_label     = "Right Click"
+
+    # ── Scroll control (SCROLL mode) ─────────────────────────────────────────
+    def handle_scroll_mode(self, landmarks, frame_w, frame_h, frame, ui):
+        """
+        AUTO-SCROLL — joystick style:
+
+        HOW IT WORKS:
+          1. Raise index + middle fingers close together → system starts arming
+             (holds steady for SCROLL_ARM_FRAMES to capture neutral Y position).
+          2. Once armed, move hand UP or DOWN from that neutral point.
+             The further from centre, the faster the scroll — 3 speed zones.
+          3. Hold hand still near centre → scroll stops (dead zone).
+          4. STOP GESTURE: make a fist (close all fingers) → immediately stops
+             scroll and resets — ready to arm again.
+
+        SPEED ZONES (distance from neutral Y):
+          Dead zone  (< SCROLL_DEAD_ZONE px)  → no scroll
+          Slow zone  (< SCROLL_SLOW_ZONE px)  → slow scroll
+          Medium zone(< SCROLL_FAST_ZONE px)  → medium scroll
+          Fast zone  (>= SCROLL_FAST_ZONE px) → fast scroll
+        """
+        tip_i  = landmark_to_pixel(landmarks[8],  frame_w, frame_h)  # Index tip
+        tip_m  = landmark_to_pixel(landmarks[12], frame_w, frame_h)  # Middle tip
+        mid_y  = (tip_i[1] + tip_m[1]) // 2
+        mid_x  = (tip_i[0] + tip_m[0]) // 2
+
+        finger_dist = euclidean_distance(tip_i, tip_m)
+
+        # ── Detect STOP gesture: fist (all fingers curled) ────────────────────
+        raised = count_raised_fingers(landmarks, frame_w, frame_h)
+        fingers_up = sum(raised[1:])   # Count index+middle+ring+pinky (ignore thumb)
+        fist_detected = fingers_up == 0
+
+        if fist_detected:
+            # Hard stop — reset everything
+            self.scroll_armed       = False
+            self.scroll_ref_y       = None
+            self.scroll_arm_counter = 0
+            self.scroll_speed       = 0
+            self.gesture_label      = "STOPPED  (open fingers to restart)"
+
+            # Draw fist indicator
+            cv2.putText(frame, "FIST  =  STOP", (mid_x - 60, mid_y - 30),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.7, (60, 60, 220), 2, cv2.LINE_AA)
+            return
+
+        two_fingers_up = (raised[1] and raised[2]           # index + middle up
+                          and not raised[3] and not raised[4]  # ring + pinky down
+                          and finger_dist < Config.SCROLL_THRESHOLD)
+
+        if not self.scroll_armed:
+            # ── ARMING PHASE: wait for steady 2-finger gesture ────────────────
+            if two_fingers_up:
+                self.scroll_arm_counter += 1
+
+                # Draw arming progress bar above fingertips
+                progress = self.scroll_arm_counter / Config.SCROLL_ARM_FRAMES
+                bar_w    = 80
+                filled_w = int(bar_w * min(progress, 1.0))
+                bar_x    = mid_x - bar_w // 2
+                bar_y    = mid_y - 45
+                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + 10),
+                              (50, 50, 50), -1)
+                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + filled_w, bar_y + 10),
+                              (0, 220, 180), -1)
+                cv2.putText(frame, "Arming...", (bar_x, bar_y - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 180), 1, cv2.LINE_AA)
+
+                if self.scroll_arm_counter >= Config.SCROLL_ARM_FRAMES:
+                    # Armed! Lock in the neutral Y reference
+                    self.scroll_ref_y = mid_y
+                    self.scroll_armed = True
+                    self.scroll_arm_counter = 0
+                    self.gesture_label = "Armed — move hand to scroll"
+            else:
+                self.scroll_arm_counter = max(0, self.scroll_arm_counter - 1)
+                self.gesture_label = "Raise index + middle to arm scroll"
+
+            # Draw fingertips
+            for pt in [tip_i, tip_m]:
+                cv2.circle(frame, pt, 8, (100, 100, 100), -1)
+
         else:
-            clicking = False
+            # ── ARMED PHASE: continuous auto-scroll based on hand position ────
+            offset = self.scroll_ref_y - mid_y   # Positive = hand moved UP = scroll up
 
-        # Visual line for left click
-        cv2.line(image, (x1, y1), (x2, y2), (0, 255, 0), 3)
+            # Determine speed zone from offset magnitude
+            abs_offset = abs(offset)
+            if abs_offset < Config.SCROLL_DEAD_ZONE:
+                speed = 0
+                zone_label = "HOLD"
+                dot_color  = (160, 160, 160)
+            elif abs_offset < Config.SCROLL_SLOW_ZONE:
+                speed = Config.SCROLL_SPEED_SLOW
+                zone_label = "SLOW"
+                dot_color  = (0, 220, 180)
+            elif abs_offset < Config.SCROLL_FAST_ZONE:
+                speed = Config.SCROLL_SPEED_MED
+                zone_label = "MED"
+                dot_color  = (0, 170, 255)
+            else:
+                speed = Config.SCROLL_SPEED_FAST
+                zone_label = "FAST"
+                dot_color  = (0, 80, 255)
 
-        # ---------------- RIGHT CLICK ----------------
-        dist2 = math.hypot(x3 - x1, y3 - y1)
+            # Apply direction (sign of offset)
+            signed_speed = speed if offset > 0 else -speed
+            self.scroll_speed = signed_speed
 
-        if dist2 < 30:
-            if not right_clicking:
-                pyautogui.rightClick()
-                right_clicking = True
+            # Execute scroll every frame (auto-continuous)
+            if signed_speed != 0:
+                pyautogui.scroll(signed_speed)
+
+            direction = "▲ UP" if signed_speed > 0 else ("▼ DOWN" if signed_speed < 0 else "■ HOLD")
+            self.gesture_label = f"Auto-scroll  {direction}  [{zone_label}]  |  Fist=Stop"
+
+            # ── Draw joystick UI ──────────────────────────────────────────────
+            # Neutral reference line
+            ref_y_screen = self.scroll_ref_y
+            cv2.line(frame, (mid_x - 50, ref_y_screen),
+                     (mid_x + 50, ref_y_screen), (80, 80, 80), 1)
+            cv2.putText(frame, "neutral", (mid_x + 54, ref_y_screen + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1, cv2.LINE_AA)
+
+            # Dead zone band
+            cv2.line(frame, (mid_x - 40, ref_y_screen - Config.SCROLL_DEAD_ZONE),
+                     (mid_x + 40, ref_y_screen - Config.SCROLL_DEAD_ZONE),
+                     (50, 50, 50), 1)
+            cv2.line(frame, (mid_x - 40, ref_y_screen + Config.SCROLL_DEAD_ZONE),
+                     (mid_x + 40, ref_y_screen + Config.SCROLL_DEAD_ZONE),
+                     (50, 50, 50), 1)
+
+            # Line from neutral to current hand position
+            cv2.line(frame, (mid_x, ref_y_screen), (mid_x, mid_y), dot_color, 2)
+
+            # Current position dot
+            cv2.circle(frame, (mid_x, mid_y), 10, dot_color, -1)
+
+            # Direction arrow and zone label
+            arrow = "▲" if signed_speed > 0 else ("▼" if signed_speed < 0 else "■")
+            cv2.putText(frame, f"{arrow} {zone_label}",
+                        (mid_x + 18, mid_y),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.65, dot_color, 2, cv2.LINE_AA)
+
+            # Fist reminder at bottom of frame area
+            cv2.putText(frame, "Fist = Stop",
+                        (mid_x - 45, mid_y + 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (120, 120, 120), 1, cv2.LINE_AA)
+
+    # ── Volume control (VOLUME mode) ─────────────────────────────────────────
+    def handle_volume_mode(self, landmarks, frame_w, frame_h, frame, ui):
+        """
+        Daily-use volume control with pinch-to-activate lock system:
+
+        HOW IT WORKS:
+          1. Hand in Volume Mode — volume is LOCKED by default (no accidental changes).
+          2. Pinch thumb + index CLOSE together (< VOL_ACTIVATE_DIST) to UNLOCK.
+          3. While unlocked, spread fingers apart to raise volume, bring together to lower.
+          4. Open fingers WIDE (> VOL_DEACTIVATE_DIST) to LOCK again and confirm the level.
+
+        This means volume only changes when you deliberately pinch-then-spread,
+        not just from any random hand position.
+        """
+        thumb = landmark_to_pixel(landmarks[4], frame_w, frame_h)
+        tip_i = landmark_to_pixel(landmarks[8], frame_w, frame_h)
+
+        raw_distance = euclidean_distance(thumb, tip_i)
+
+        # ── Smooth the raw distance (EMA) ─────────────────────────────────────
+        self.smooth_vol_dist = smooth_value(
+            self.smooth_vol_dist, raw_distance, Config.VOL_SMOOTHING
+        )
+        distance = self.smooth_vol_dist
+
+        # ── Pinch-lock state machine ───────────────────────────────────────────
+        # vol_active = True means user has pinched in and is actively adjusting
+        if not self.vol_active:
+            # LOCKED state — waiting for a deliberate pinch-in gesture
+            if distance < Config.VOL_ACTIVATE_DIST:
+                self.vol_active = True
+                # Snap smooth distance to current real distance so no jump on activate
+                self.smooth_vol_dist = raw_distance
         else:
-            right_clicking = False
+            # UNLOCKED state — user is actively controlling volume
+            if distance > Config.VOL_DEACTIVATE_DIST:
+                # Wide open = intentional release → lock again
+                self.vol_active = False
 
-    cv2.imshow("Hand movement video capture", image)
+        # ── Compute target volume from distance (only when active) ────────────
+        if self.vol_active:
+            # Map smoothed distance → 0–100% range
+            raw_pct = np.interp(
+                distance,
+                [Config.VOL_ACTIVATE_DIST, Config.VOL_MAX_DIST],
+                [0, 100]
+            )
+            # set_volume_percent updates vol_ctrl.current_pct internally
+            self.volume_pct = self.vol_ctrl.set_volume_percent(raw_pct)
+            self.gesture_label = f"Volume: {self.volume_pct}%  [ACTIVE]"
+        else:
+            # Locked — read from internal tracker (no Windows API call every frame)
+            self.volume_pct = self.vol_ctrl.current_pct
+            self.gesture_label = f"Volume: {self.volume_pct}%  [pinch to adjust]"
 
-    if cv2.waitKey(1) == 27:
-        break
+        # ── Draw UI feedback ──────────────────────────────────────────────────
+        # Color: orange-gold when active, grey when locked
+        line_color  = (0, 200, 255) if self.vol_active else (140, 140, 140)
+        dot_color   = (0, 200, 255) if self.vol_active else (100, 100, 100)
 
-camera.release()
-cv2.destroyAllWindows()
+        ui.draw_distance_line(frame, thumb, tip_i, distance, line_color)
+        cv2.circle(frame, thumb, 12, dot_color, -1)
+        cv2.circle(frame, tip_i, 12, dot_color, -1)
+
+        # Lock/unlock status badge near the fingertips midpoint
+        mid = ((thumb[0] + tip_i[0]) // 2, (thumb[1] + tip_i[1]) // 2 - 25)
+        status_text  = "ACTIVE" if self.vol_active else "LOCKED"
+        status_color = (0, 220, 100) if self.vol_active else (60, 60, 200)
+        cv2.putText(frame, status_text, mid,
+                    cv2.FONT_HERSHEY_DUPLEX, 0.6, status_color, 2, cv2.LINE_AA)
+
+    # ── Main per-frame processing ─────────────────────────────────────────────
+    def process_frame(self, frame, hand_landmarks, frame_w, frame_h, ui):
+        """
+        Called every frame when a hand is detected.
+        Determines active gesture and dispatches to the correct handler.
+        """
+        lm = hand_landmarks.landmark
+
+        # ── Finger state ──────────────────────────────────────────────────────
+        raised = count_raised_fingers(lm, frame_w, frame_h)
+        # raised = [thumb, index, middle, ring, pinky]
+
+        # ── Mode-switch gesture: exactly 3 fingers (index+middle+ring) up ─────
+        three_up = (not raised[0]     # thumb down
+                    and raised[1]     # index up
+                    and raised[2]     # middle up
+                    and raised[3]     # ring up
+                    and not raised[4])# pinky down
+
+        if three_up:
+            self.switch_mode()
+            self.gesture_label = "Mode Switch"
+            return   # Don't process other gestures this frame
+
+        # ── Dispatch to mode handler ──────────────────────────────────────────
+        if self.mode == "MOUSE":
+            self.handle_mouse_mode(lm, frame_w, frame_h, frame, ui)
+
+        elif self.mode == "SCROLL":
+            self.handle_scroll_mode(lm, frame_w, frame_h, frame, ui)
+
+        elif self.mode == "VOLUME":
+            self.handle_volume_mode(lm, frame_w, frame_h, frame, ui)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN APPLICATION LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    print("╔══════════════════════════════════════════════════════╗")
+    print("║   Gesture Controlled System — Starting...           ║")
+    print("║   Press  Q  in the camera window to quit            ║")
+    print("╚══════════════════════════════════════════════════════╝")
+
+    # ── MediaPipe hands setup ─────────────────────────────────────────────────
+    mp_hands   = mp.solutions.hands
+    mp_draw    = mp.solutions.drawing_utils
+    mp_styles  = mp.solutions.drawing_styles
+
+    hands = mp_hands.Hands(
+        static_image_mode        = False,
+        max_num_hands            = 1,       # Single hand for cleaner control
+        min_detection_confidence = 0.75,
+        min_tracking_confidence  = 0.65,
+    )
+
+    # ── Webcam setup ──────────────────────────────────────────────────────────
+    cap = cv2.VideoCapture(Config.CAM_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  Config.CAM_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, Config.CAM_HEIGHT)
+
+    if not cap.isOpened():
+        print("[ERROR] Cannot open webcam. Check CAM_INDEX in Config.")
+        return
+
+    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"[INFO]  Camera resolution: {actual_w}×{actual_h}")
+
+    # ── Controllers ───────────────────────────────────────────────────────────
+    controller = GestureController()
+    ui         = UIRenderer(actual_w, actual_h)
+
+    # ── FPS tracking ──────────────────────────────────────────────────────────
+    fps_prev_time = time.time()
+    fps           = 0.0
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  MAIN LOOP
+    # ─────────────────────────────────────────────────────────────────────────
+    while True:
+        success, frame = cap.read()
+        if not success:
+            print("[WARNING] Failed to read frame. Retrying...")
+            continue
+
+        # Flip for mirror-view
+        if Config.FLIP_CAMERA:
+            frame = cv2.flip(frame, 1)
+
+        # ── FPS calculation ───────────────────────────────────────────────────
+        now          = time.time()
+        fps          = 0.9 * fps + 0.1 * (1.0 / max(now - fps_prev_time, 1e-5))
+        fps_prev_time = now
+
+        # ── Hand detection ────────────────────────────────────────────────────
+        rgb_frame    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb_frame.flags.writeable = False
+        results      = hands.process(rgb_frame)
+        rgb_frame.flags.writeable = True
+
+        hand_detected = results.multi_hand_landmarks is not None
+
+        if hand_detected:
+            for hand_lms in results.multi_hand_landmarks:
+                # Draw skeletal overlay
+                mp_draw.draw_landmarks(
+                    frame, hand_lms,
+                    mp_hands.HAND_CONNECTIONS,
+                    mp_styles.get_default_hand_landmarks_style(),
+                    mp_styles.get_default_hand_connections_style(),
+                )
+                # Process gestures
+                controller.process_frame(frame, hand_lms, actual_w, actual_h, ui)
+        else:
+            controller.gesture_label = "No Hand Detected"
+
+        # ── Draw UI ───────────────────────────────────────────────────────────
+        ui.draw_active_zone(frame)
+        ui.draw_info_panel(frame, fps, controller.mode, controller.gesture_label)
+        ui.draw_volume_bar(frame, controller.volume_pct, controller.vol_active)
+        ui.draw_help_strip(frame)
+
+        # Click flash feedback
+        if time.time() < controller.click_flash_until:
+            ui.draw_click_flash(frame, controller.click_flash_type)
+
+        # Mode switch flash
+        if time.time() < controller.mode_flash_until:
+            ui.draw_mode_switch_flash(frame, controller.mode_flash_label)
+
+        # ── Show frame ────────────────────────────────────────────────────────
+        cv2.imshow("Gesture Control System", frame)
+
+        # ── Key handling ──────────────────────────────────────────────────────
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or key == ord('Q'):
+            print("[INFO]  Quit signal received. Exiting...")
+            break
+        elif key == ord('m') or key == ord('M'):
+            # Manual mode switch with 'M' key as backup
+            controller.switch_mode()
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+    cap.release()
+    cv2.destroyAllWindows()
+    hands.close()
+    print("[INFO]  Resources released. Goodbye!")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    main()
