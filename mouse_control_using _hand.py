@@ -11,25 +11,68 @@ REQUIRED LIBRARIES (install via pip):
 USAGE:
     python gesture_control_system.py
 
-GESTURE GUIDE:
-    ┌─────────────────┬──────────────────────────────────────────────────┐
-    │ Gesture         │ Action                                           │
-    ├─────────────────┼──────────────────────────────────────────────────┤
-    │ Index finger up │ Move cursor (Mouse Mode)                         │
-    │ Pinch I+Thumb   │ Left Click                                       │
-    │ Pinch M+Thumb   │ Right Click                                      │
-    │ Index+Middle up │ Arm auto-scroll (hold steady 8 frames)           │
-    │ Hand UP/DOWN    │ Auto-scroll — distance from neutral = speed       │
-    │ Fist            │ Stop auto-scroll immediately                      │
-    │ Thumb+Index     │ Volume Mode — spread apart/together to change    │
-    │ 3 Fingers up    │ Switch between Mouse → Scroll → Volume modes     │
-    │ Press 'Q'       │ Quit the application                             │
-    └─────────────────┴──────────────────────────────────────────────────┘
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ GESTURE GUIDE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ GLOBAL (work in every mode)
+ ┌─────────────────────────────┬──────────────────────────────────────────┐
+ │ Gesture                     │ Action                                   │
+ ├─────────────────────────────┼──────────────────────────────────────────┤
+ │ Index + Middle + Ring up    │ Switch mode: Mouse → Scroll → Volume     │
+ │ Hold open palm 1s           │ Screenshot → saved to /screenshots/      │
+ │ Press  H  key               │ Toggle on-screen gesture guide           │
+ │ Press  M  key               │ Manually switch mode                     │
+ │ Press  Q  key               │ Quit application                         │
+ └─────────────────────────────┴──────────────────────────────────────────┘
+
+ MOUSE MODE  (default)
+ ┌─────────────────────────────┬──────────────────────────────────────────┐
+ │ Gesture                     │ Action                                   │
+ ├─────────────────────────────┼──────────────────────────────────────────┤
+ │ Index finger up             │ Move cursor smoothly                     │
+ │ Quick pinch Thumb + Index   │ Left Click                               │
+ │ Two quick pinches (< 0.35s) │ Double Click                             │
+ │ Hold pinch for 0.8s         │ Start Drag                               │
+ │   → move hand               │   Drag item across screen                │
+ │   → release pinch           │   Drop item at current position          │
+ │ Quick pinch Thumb + Middle  │ Right Click                              │
+ └─────────────────────────────┴──────────────────────────────────────────┘
+
+ SCROLL MODE
+ ┌─────────────────────────────┬──────────────────────────────────────────┐
+ │ Gesture                     │ Action                                   │
+ ├─────────────────────────────┼──────────────────────────────────────────┤
+ │ Index + Middle up, close    │ Arm auto-scroll (hold ~8 frames steady)  │
+ │ Hand above neutral point    │ Scroll UP  — further = faster            │
+ │ Hand below neutral point    │ Scroll DOWN — further = faster           │
+ │ Hand near neutral (< 18px)  │ Dead zone — scroll pauses                │
+ │ Make a Fist                 │ Stop scroll and reset                    │
+ └─────────────────────────────┴──────────────────────────────────────────┘
+ Speed zones:  < 18px = HOLD  │  18–45px = SLOW  │  45–90px = MED  │  90px+ = FAST
+
+ VOLUME MODE
+ ┌─────────────────────────────┬──────────────────────────────────────────┐
+ │ Gesture                     │ Action                                   │
+ ├─────────────────────────────┼──────────────────────────────────────────┤
+ │ (enter mode)                │ Volume is LOCKED — no accidental changes │
+ │ Pinch Thumb + Index (< 60px)│ UNLOCK volume control                    │
+ │ Spread fingers apart        │ Increase volume (up to 100%)             │
+ │ Bring fingers together      │ Decrease volume (down to 0%)             │
+ │ Open wide (> 80px)          │ LOCK volume at current level             │
+ └─────────────────────────────┴──────────────────────────────────────────┘
+ Volume bar on right side glows CYAN when active, GREY when locked.
+ Volume affects both master system volume AND all app sessions (Chrome, VLC, etc.)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 # ─── Standard Library ──────────────────────────────────────────────────────────
 import math
 import time
+import os
+import threading
+from datetime import datetime
 
 # ─── Third-Party Libraries ─────────────────────────────────────────────────────
 import cv2
@@ -81,15 +124,39 @@ class Config:
     SCROLL_SPEED_FAST     = 10   # pyautogui scroll units per frame (fast zone)
 
     # ── Volume Control ────────────────────────────────────────────────────────
-    VOL_MIN_DIST        = 30     # Finger distance (px) = 0% volume
-    VOL_MAX_DIST        = 180    # Finger distance (px) = 100% volume
-    VOL_ACTIVATE_DIST   = 60     # Pinch tighter than this to UNLOCK volume control
-    VOL_DEACTIVATE_DIST = 80     # Open wider than this to LOCK (stop changing volume)
-    VOL_STEP            = 2      # Snap volume to nearest N% — feels like real buttons
-    VOL_SMOOTHING       = 6      # Higher = slower/smoother volume response (3–10)
+    # HOW DISTANCES WORK:
+    #   VOL_ACTIVATE_DIST  = how close fingers must pinch to UNLOCK (small value)
+    #   VOL_MIN_DIST       = finger distance that maps to 0% volume
+    #   VOL_MAX_DIST       = finger distance that maps to 100% volume
+    #   VOL_DEACTIVATE_DIST= how wide to open to LOCK again
+    #
+    # Rule: VOL_ACTIVATE_DIST < VOL_MIN_DIST < VOL_MAX_DIST < VOL_DEACTIVATE_DIST
+    # This way: pinch to unlock → spread from min to max → open wide to lock
+    #
+    VOL_ACTIVATE_DIST   = 30     # Pinch THIS close to unlock  (tight pinch)
+    VOL_MIN_DIST        = 30     # Distance = 0% volume        (same as activate)
+    VOL_MAX_DIST        = 220    # Distance = 100% volume      (fully spread hand)
+    VOL_DEACTIVATE_DIST = 240    # Open wider than this to lock (beyond max)
+    VOL_STEP            = 2      # Snap to nearest N% increment
+    VOL_SMOOTHING       = 5      # EMA smoothing factor (3–10)
 
     # ── Mode Switching ────────────────────────────────────────────────────────
     MODE_SWITCH_COOLDOWN = 1.2   # Seconds before another mode switch is allowed
+
+    # ── Screenshot ────────────────────────────────────────────────────────────
+    SCREENSHOT_COOLDOWN     = 2.0   # Seconds between allowed screenshots
+    SCREENSHOT_HOLD_TIME    = 1.0   # Seconds to hold open palm before screenshot fires
+    # Save to Pictures\GestureScreenshots — always writable, even on OneDrive Desktop
+    SCREENSHOT_FOLDER       = os.path.join(
+                                os.path.expanduser("~"),
+                                "Pictures", "GestureScreenshots"
+                              )
+
+    # ── Double Click ──────────────────────────────────────────────────────────
+    DOUBLE_CLICK_GAP     = 0.35  # Max seconds between two pinches = double click
+
+    # ── Drag & Drop ───────────────────────────────────────────────────────────
+    DRAG_HOLD_TIME       = 0.8   # Seconds to hold pinch before drag starts
 
     # ── UI ────────────────────────────────────────────────────────────────────
     UI_COLOR_ACCENT      = (0,   220, 180)   # Teal accent
@@ -181,28 +248,83 @@ class VolumeController:
 
     def __init__(self):
         self.enabled          = PYCAW_AVAILABLE
-        self.master_interface = None   # IAudioEndpointVolume for master
-        self._last_set_pct    = -1     # Last pct sent to avoid redundant API calls
-        self.current_pct      = 50     # Internal tracked value
+        self.master_interface = None
+        self._last_set_pct    = -1
+        self.current_pct      = 50
 
         if self.enabled:
             try:
-                # ── Master volume interface ───────────────────────────────────
-                devices = AudioUtilities.GetSpeakers()
-                interface = devices.Activate(
-                    IAudioEndpointVolume._iid_, CLSCTX_ALL, None
-                )
-                self.master_interface = cast(interface, POINTER(IAudioEndpointVolume))
-
-                # Read actual system volume once at startup
+                self.master_interface = self._get_master_interface()
                 scalar = self.master_interface.GetMasterVolumeLevelScalar()
                 self.current_pct   = int(scalar * 100)
                 self._last_set_pct = self.current_pct
                 print(f"[INFO]  Volume controller ready. Current volume: {self.current_pct}%")
-
             except Exception as e:
                 print(f"[WARNING] Could not initialise volume controller: {e}")
                 self.enabled = False
+
+    def _get_master_interface(self):
+        """
+        Get IAudioEndpointVolume using multiple fallback methods so it works
+        across all pycaw versions and Windows setups.
+
+        Method 1 — Direct COM via IMMDeviceEnumerator (most reliable, any pycaw version)
+        Method 2 — pycaw AudioUtilities with .id property   (newer pycaw)
+        Method 3 — pycaw AudioUtilities direct Activate      (older pycaw)
+        """
+        from ctypes import cast, POINTER, WinError
+        from comtypes import CLSCTX_ALL
+        import comtypes.client
+
+        # ── Method 1: IMMDeviceEnumerator (works on ALL versions) ────────────
+        try:
+            # These GUIDs are fixed Windows constants — never change
+            CLSID_MMDeviceEnumerator = "{BCDE0395-E52F-467C-8E3D-C4579291692E}"
+            IID_IMMDeviceEnumerator  = "{A95664D2-9614-4F35-A746-DE8DB63617E6}"
+            IID_IMMDevice            = "{D666063F-1587-4E43-81F1-B948E807363F}"
+
+            enumerator = comtypes.client.CreateObject(
+                CLSID_MMDeviceEnumerator,
+                interface=comtypes.IUnknown
+            )
+            # QueryInterface to IMMDeviceEnumerator
+            from comtypes import GUID
+            imm_enum_iid = GUID(IID_IMMDeviceEnumerator)
+            imm_enum = enumerator.QueryInterface(comtypes.IUnknown, imm_enum_iid)
+
+            # GetDefaultAudioEndpoint(eRender=0, eConsole=0)
+            from pycaw.pycaw import IMMDeviceEnumerator as PycawEnum
+            real_enum = enumerator.QueryInterface(PycawEnum)
+            device    = real_enum.GetDefaultAudioEndpoint(0, 0)
+            interface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            return cast(interface, POINTER(IAudioEndpointVolume))
+        except Exception:
+            pass   # Fall through to next method
+
+        # ── Method 2: pycaw AudioDevice with .id (newer pycaw >= 0.4.0) ──────
+        try:
+            from pycaw.pycaw import AudioUtilities as AU
+            device = AU.GetSpeakers()
+            # Newer pycaw returns AudioDevice with an id property
+            if hasattr(device, 'id'):
+                from pycaw.pycaw import IMMDeviceEnumerator
+                from comtypes.client import CreateObject
+                enumerator = CreateObject(
+                    "{BCDE0395-E52F-467C-8E3D-C4579291692E}",
+                    interface=IMMDeviceEnumerator
+                )
+                imm_device = enumerator.GetDevice(device.id)
+                interface  = imm_device.Activate(
+                    IAudioEndpointVolume._iid_, CLSCTX_ALL, None
+                )
+                return cast(interface, POINTER(IAudioEndpointVolume))
+        except Exception:
+            pass
+
+        # ── Method 3: direct Activate on GetSpeakers (older pycaw) ───────────
+        device    = AudioUtilities.GetSpeakers()
+        interface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        return cast(interface, POINTER(IAudioEndpointVolume))
 
     def _set_all_session_volumes(self, scalar):
         """
@@ -375,11 +497,25 @@ class UIRenderer:
 
     # ── Click flash indicator ─────────────────────────────────────────────────
     def draw_click_flash(self, frame, click_type):
-        color = Config.UI_COLOR_SUCCESS if click_type == "LEFT" else Config.UI_COLOR_WARN
-        label = f"{click_type} CLICK"
+        if click_type == "LEFT":
+            color, label = Config.UI_COLOR_SUCCESS, "LEFT CLICK"
+        elif click_type == "DOUBLE":
+            color, label = (0, 200, 255), "DOUBLE CLICK"
+        else:
+            color, label = Config.UI_COLOR_WARN, "RIGHT CLICK"
         cv2.putText(frame, label,
-                    (self.w // 2 - 60, self.h - 30),
-                    self.FONT_BOLD, 0.8, color, 2, cv2.LINE_AA)
+                    (self.w // 2 - 70, self.h - 30),
+                    self.FONT_BOLD, 0.85, color, 2, cv2.LINE_AA)
+
+    # ── Screenshot flash indicator ────────────────────────────────────────────
+    def draw_screenshot_flash(self, frame, filename):
+        # Dark overlay bar at top
+        draw_rounded_rect(frame, (self.w // 2 - 180, 8),
+                          (self.w // 2 + 180, 52),
+                          (10, 10, 10), radius=8, alpha=0.80)
+        cv2.putText(frame, f"Screenshot saved: {filename}",
+                    (self.w // 2 - 168, 36),
+                    self.FONT, 0.46, (0, 255, 180), 1, cv2.LINE_AA)
 
     # ── Mode-switch flash ─────────────────────────────────────────────────────
     def draw_mode_switch_flash(self, frame, new_mode):
@@ -389,12 +525,94 @@ class UIRenderer:
                     (self.w // 2 - 100, self.h // 2),
                     self.FONT_BOLD, 1.1, color, 2, cv2.LINE_AA)
 
+    # ── On-screen Gesture Guide (press H to toggle) ───────────────────────────
+    def draw_gesture_guide(self, frame, mode):
+        """
+        Semi-transparent overlay panel listing all gestures for the active mode.
+        Shown in the centre of the frame when user presses H.
+        """
+        # Panel dimensions
+        px, py = 60, 55
+        pw, ph = self.w - 120, self.h - 110
+        draw_rounded_rect(frame, (px, py), (px + pw, py + ph),
+                          (10, 10, 15), radius=14, alpha=0.88)
+
+        # Title bar
+        cv2.rectangle(frame, (px, py), (px + pw, py + 36),
+                      (30, 30, 40), -1)
+        cv2.putText(frame, "GESTURE GUIDE  —  Press H to close",
+                    (px + 12, py + 24),
+                    self.FONT_BOLD, 0.55, Config.UI_COLOR_ACCENT, 1, cv2.LINE_AA)
+
+        y = py + 58
+        lh = 22   # line height
+
+        def section(title, color):
+            nonlocal y
+            cv2.putText(frame, title, (px + 12, y),
+                        self.FONT_BOLD, 0.52, color, 1, cv2.LINE_AA)
+            y += lh
+
+        def row(gesture, action, highlight=False):
+            nonlocal y
+            color = (0, 255, 180) if highlight else Config.UI_COLOR_TEXT
+            cv2.putText(frame, f"  {gesture:<28} {action}",
+                        (px + 12, y), self.FONT, 0.42, color, 1, cv2.LINE_AA)
+            y += lh
+
+        def divider():
+            nonlocal y
+            cv2.line(frame, (px + 10, y - 4), (px + pw - 10, y - 4),
+                     (50, 50, 60), 1)
+            y += 6
+
+        # ── GLOBAL ───────────────────────────────────────────────────────────
+        section("GLOBAL  (all modes)", (180, 180, 180))
+        row("Index+Middle+Ring up",    "Switch Mode: Mouse→Scroll→Volume")
+        row("Hold open palm  1s",       "Screenshot  →  /screenshots/")
+        row("H key",                   "Toggle this guide")
+        row("M key",                   "Manual mode switch")
+        row("Q key",                   "Quit")
+        divider()
+
+        # ── MODE-SPECIFIC ─────────────────────────────────────────────────────
+        mode_color = self.MODE_COLORS.get(mode, Config.UI_COLOR_ACCENT)
+
+        if mode == "MOUSE":
+            section(f"MOUSE MODE  (active)", mode_color)
+            row("Index finger up",         "Move cursor",          highlight=True)
+            row("Quick pinch Thumb+Index", "Left Click",           highlight=True)
+            row("Two quick pinches",       "Double Click",         highlight=True)
+            row("Hold pinch 0.8s → move",  "Drag & Drop",          highlight=True)
+            row("Hold open palm  1s",       "Screenshot",           highlight=True)
+            row("Quick pinch Thumb+Middle","Right Click",          highlight=True)
+
+        elif mode == "SCROLL":
+            section(f"SCROLL MODE  (active)", mode_color)
+            row("Index+Middle up, close",  "Arm auto-scroll",      highlight=True)
+            row("Hand UP from neutral",    "Scroll Up",            highlight=True)
+            row("Hand DOWN from neutral",  "Scroll Down",          highlight=True)
+            row("Near neutral  (< 18px)",  "Dead zone — pause",    highlight=True)
+            row("Fist",                    "Stop & reset scroll",  highlight=True)
+            divider()
+            row("< 18px = HOLD",           "18-45 = SLOW   45-90 = MED   90+ = FAST")
+
+        elif mode == "VOLUME":
+            section(f"VOLUME MODE  (active)", mode_color)
+            row("(enter mode)",            "Volume LOCKED by default", highlight=True)
+            row("Pinch < 60px",            "UNLOCK volume",        highlight=True)
+            row("Spread fingers",          "Increase volume",      highlight=True)
+            row("Close fingers",           "Decrease volume",      highlight=True)
+            row("Open wide > 80px",        "LOCK at current level",highlight=True)
+            divider()
+            row("Vol bar CYAN = active",   "Vol bar GREY = locked")
+
     # ── Bottom gesture guide strip ────────────────────────────────────────────
     def draw_help_strip(self, frame):
         help_y = self.h - 12
-        hints  = "Q=Quit  |  3 Fingers=Switch Mode  |  Pinch I=LClick  |  Pinch M=RClick"
+        hints  = "Q=Quit  |  H=Gesture Guide  |  M=Switch Mode  |  3 Fingers=Switch Mode  |  Open Palm 1s=Screenshot"
         cv2.putText(frame, hints, (10, help_y),
-                    self.FONT, 0.38, (120, 120, 120), 1, cv2.LINE_AA)
+                    self.FONT, 0.36, (120, 120, 120), 1, cv2.LINE_AA)
 
     # ── Finger distance indicator line ────────────────────────────────────────
     def draw_distance_line(self, frame, p1, p2, distance, color=None):
@@ -443,10 +661,26 @@ class GestureController:
         self.last_left_click   = 0.0
         self.last_right_click  = 0.0
         self.last_mode_switch  = 0.0
+        self.last_screenshot   = 0.0
         self.click_flash_until = 0.0
         self.click_flash_type  = ""
         self.mode_flash_until  = 0.0
         self.mode_flash_label  = ""
+
+        # ── Screenshot state ──────────────────────────────────────────────────
+        self.screenshot_flash_until = 0.0
+        self.screenshot_last_name   = ""
+        self.screenshot_hold_start  = 0.0
+        self.screenshot_pending     = False   # Set True by gesture, consumed by main loop
+
+        # ── Double click state ────────────────────────────────────────────────
+        self.last_pinch_time   = 0.0        # Time of most recent pinch release
+        self.pinch_was_down    = False      # Track pinch edge (down → up transition)
+
+        # ── Drag & Drop state ─────────────────────────────────────────────────
+        self.drag_active       = False      # True = currently dragging
+        self.drag_pinch_start  = 0.0       # Timestamp when pinch was first held
+        self.drag_pinch_held   = False      # True = pinch is currently being held
 
         # ── Sub-modules ───────────────────────────────────────────────────────
         self.vol_ctrl        = VolumeController()
@@ -474,44 +708,209 @@ class GestureController:
         self.mode_flash_until = now + 0.9
         print(f"[MODE] Switched to {self.mode}")
 
+    # ── Screenshot ───────────────────────────────────────────────────────────
+    def request_screenshot(self):
+        """
+        Fires pyautogui.screenshot() in a background thread so the main loop
+        is NEVER blocked. This is the only reliable way to prevent OpenCV's
+        waitKey from receiving garbage WM_KEYDOWN messages that look like 'Q'
+        and cause the program to exit.
+        """
+        now = time.time()
+        if now - self.last_screenshot < Config.SCREENSHOT_COOLDOWN:
+            return
+        if self.screenshot_pending:
+            return   # Already one in flight — don't stack up
+
+        self.last_screenshot    = now   # Block further requests immediately
+        self.screenshot_pending = True
+
+        # Run in daemon thread — dies cleanly if main program exits
+        t = threading.Thread(target=self._screenshot_worker, daemon=True)
+        t.start()
+
+    def _screenshot_worker(self):
+        """
+        Runs in background thread. Saves screenshot and updates state vars.
+        Uses a threading.Lock so state writes are safe from the main thread.
+        """
+        folder = Config.SCREENSHOT_FOLDER
+        os.makedirs(folder, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename  = f"screenshot_{timestamp}.png"
+        filepath  = os.path.join(folder, filename)
+
+        try:
+            img = pyautogui.screenshot()
+            img.save(filepath)
+            # These writes are safe — main thread only reads them for display
+            self.screenshot_last_name   = filename
+            self.screenshot_flash_until = time.time() + 1.5
+            print(f"[SCREENSHOT] Saved → {filepath}")
+        except Exception as e:
+            print(f"[WARNING] Screenshot failed: {e}")
+        finally:
+            self.screenshot_pending = False   # Always release the lock
+
     # ── Cursor control (MOUSE mode) ───────────────────────────────────────────
     def handle_mouse_mode(self, landmarks, frame_w, frame_h, frame, ui):
-        """Move cursor using index finger tip with smoothing."""
-        fr   = Config.FRAME_REDUCTION
-        tip  = landmark_to_pixel(landmarks[8], frame_w, frame_h)   # Index tip
-        tip2 = landmark_to_pixel(landmarks[12], frame_w, frame_h)  # Middle tip
-        thumb= landmark_to_pixel(landmarks[4], frame_w, frame_h)
+        """
+        MOUSE MODE — full cursor control with:
+          • Smooth cursor tracking   (index finger tip)
+          • Left click               (pinch thumb + index, quick)
+          • Double click             (two quick pinches within DOUBLE_CLICK_GAP seconds)
+          • Right click              (pinch thumb + middle)
+          • Drag & Drop              (hold pinch for DRAG_HOLD_TIME seconds → drag → release)
+          • Screenshot               (hold open palm for 1 second)
+        """
+        fr    = Config.FRAME_REDUCTION
+        tip   = landmark_to_pixel(landmarks[8],  frame_w, frame_h)   # Index tip
+        tip_m = landmark_to_pixel(landmarks[12], frame_w, frame_h)   # Middle tip
+        thumb = landmark_to_pixel(landmarks[4],  frame_w, frame_h)   # Thumb tip
+        pinky = landmark_to_pixel(landmarks[20], frame_w, frame_h)   # Pinky tip
 
-        # Draw fingertip marker
-        cv2.circle(frame, tip, 10, Config.UI_COLOR_ACCENT, -1)
+        raised = count_raised_fingers(landmarks, frame_w, frame_h)
 
-        # Map from active zone to screen coordinates
+        # ── Screenshot gesture: ALL 5 fingers open (open palm) held for 1s ───
+        # Much easier than thumb+pinky — just open your hand fully and hold still
+        open_palm = raised[0] and raised[1] and raised[2] and raised[3] and raised[4]
+
+        if open_palm and (time.time() - self.last_screenshot) >= Config.SCREENSHOT_COOLDOWN:
+            if self.screenshot_hold_start == 0.0:
+                self.screenshot_hold_start = time.time()   # Start timing the hold
+
+            held = time.time() - self.screenshot_hold_start
+            progress = min(held / Config.SCREENSHOT_HOLD_TIME, 1.0)
+
+            # Draw circular charging indicator in centre of palm
+            palm_cx = (landmark_to_pixel(landmarks[0], frame_w, frame_h)[0] +
+                       landmark_to_pixel(landmarks[9], frame_w, frame_h)[0]) // 2
+            palm_cy = (landmark_to_pixel(landmarks[0], frame_w, frame_h)[1] +
+                       landmark_to_pixel(landmarks[9], frame_w, frame_h)[1]) // 2
+
+            # Background circle
+            cv2.circle(frame, (palm_cx, palm_cy), 32, (40, 40, 40), -1)
+            # Progress arc (approximated with filled wedge overlay)
+            cv2.circle(frame, (palm_cx, palm_cy), 32, (0, 255, 180),
+                       max(1, int(3 * progress + 1)))
+            # Countdown text inside
+            remaining = Config.SCREENSHOT_HOLD_TIME - held
+            cv2.putText(frame, f"{remaining:.1f}s",
+                        (palm_cx - 18, palm_cy + 6),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.52, (0, 255, 180), 1, cv2.LINE_AA)
+            cv2.putText(frame, "Hold for screenshot",
+                        (palm_cx - 68, palm_cy + 52),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 220, 180), 1, cv2.LINE_AA)
+
+            self.gesture_label = f"Screenshot in {remaining:.1f}s — hold palm open"
+
+            if progress >= 1.0:
+                # Hold complete — request screenshot (main loop handles actual capture)
+                self.request_screenshot()
+                self.screenshot_hold_start = 0.0
+            return   # Don't process clicks while palm is open for screenshot
+
+        else:
+            # Palm not open — reset hold timer
+            self.screenshot_hold_start = 0.0
+
+        # ── Cursor movement via index fingertip ───────────────────────────────
+        cv2.circle(frame, tip, 10,
+                   (0, 100, 255) if self.drag_active else Config.UI_COLOR_ACCENT, -1)
+
         mapped_x = np.interp(tip[0], (fr, frame_w - fr), (0, self.screen_w))
         mapped_y = np.interp(tip[1], (fr, frame_h - fr), (0, self.screen_h))
-
-        # Smooth
         smooth_x = smooth_value(self.prev_x, mapped_x, Config.SMOOTHING)
         smooth_y = smooth_value(self.prev_y, mapped_y, Config.SMOOTHING)
         self.prev_x, self.prev_y = smooth_x, smooth_y
 
-        pyautogui.moveTo(smooth_x, smooth_y)
-        self.gesture_label = "Cursor Move"
+        # Move normally OR drag if drag is active
+        if self.drag_active:
+            pyautogui.moveTo(smooth_x, smooth_y)
+            self.gesture_label = "Dragging...  (release pinch to drop)"
+        else:
+            pyautogui.moveTo(smooth_x, smooth_y)
+            self.gesture_label = "Cursor Move"
 
-        # ── Left Click: thumb ↔ index finger pinch ────────────────────────────
-        left_dist = euclidean_distance(thumb, tip)
-        ui.draw_distance_line(frame, thumb, tip, left_dist, (100, 255, 100))
-        now = time.time()
-        if left_dist < Config.CLICK_THRESHOLD and (now - self.last_left_click) > Config.CLICK_COOLDOWN:
-            pyautogui.click()
-            self.last_left_click   = now
-            self.click_flash_type  = "LEFT"
-            self.click_flash_until = now + 0.35
-            self.gesture_label     = "Left Click"
+        now        = time.time()
+        left_dist  = euclidean_distance(thumb, tip)
+        right_dist = euclidean_distance(thumb, tip_m)
+        pinching   = left_dist < Config.CLICK_THRESHOLD
 
-        # ── Right Click: thumb ↔ middle finger pinch ──────────────────────────
-        right_dist = euclidean_distance(thumb, tip2)
-        ui.draw_distance_line(frame, thumb, tip2, right_dist, (255, 100, 100))
-        if right_dist < Config.CLICK_THRESHOLD and (now - self.last_right_click) > Config.CLICK_COOLDOWN:
+        # Draw distance lines
+        ui.draw_distance_line(frame, thumb, tip,  left_dist,  (100, 255, 100))
+        ui.draw_distance_line(frame, thumb, tip_m, right_dist, (255, 100, 100))
+
+        # ── Drag & Drop logic ─────────────────────────────────────────────────
+        if pinching:
+            if not self.drag_pinch_held:
+                # Pinch just started — record start time
+                self.drag_pinch_held  = True
+                self.drag_pinch_start = now
+
+            held_duration = now - self.drag_pinch_start
+
+            if not self.drag_active:
+                # Show drag charging bar — fills up as user holds pinch
+                charge = min(held_duration / Config.DRAG_HOLD_TIME, 1.0)
+                bar_x  = thumb[0] - 30
+                bar_y  = thumb[1] - 25
+                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + 60, bar_y + 8),
+                              (50, 50, 50), -1)
+                cv2.rectangle(frame, (bar_x, bar_y),
+                              (bar_x + int(60 * charge), bar_y + 8),
+                              (0, 100, 255), -1)
+                cv2.putText(frame, "Hold to Drag", (bar_x - 10, bar_y - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 100, 255), 1)
+
+                if held_duration >= Config.DRAG_HOLD_TIME:
+                    # Threshold reached — start drag
+                    self.drag_active = True
+                    pyautogui.mouseDown()
+                    self.gesture_label = "Drag started!"
+                    print("[DRAG] Drag started")
+            else:
+                # Already dragging — just show visual
+                cv2.putText(frame, "DRAGGING", (tip[0] + 15, tip[1] - 15),
+                            cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 100, 255), 2)
+
+        else:
+            # Pinch released
+            if self.drag_pinch_held:
+                if self.drag_active:
+                    # Drop!
+                    pyautogui.mouseUp()
+                    self.drag_active  = False
+                    self.gesture_label = "Dropped!"
+                    print("[DRAG] Dropped")
+                else:
+                    # Short pinch (not a drag) — handle click / double click
+                    if (now - self.last_left_click) > Config.CLICK_COOLDOWN:
+                        # Check for double click — was there a recent pinch?
+                        if (now - self.last_pinch_time) < Config.DOUBLE_CLICK_GAP:
+                            pyautogui.doubleClick()
+                            self.click_flash_type  = "DOUBLE"
+                            self.click_flash_until = now + 0.4
+                            self.gesture_label     = "Double Click!"
+                            self.last_pinch_time   = 0.0   # Reset so triple doesn't fire
+                            print("[CLICK] Double click")
+                        else:
+                            pyautogui.click()
+                            self.click_flash_type  = "LEFT"
+                            self.click_flash_until = now + 0.35
+                            self.gesture_label     = "Left Click"
+                            self.last_pinch_time   = now   # Record for double-click detection
+
+                        self.last_left_click = now
+
+                self.drag_pinch_held  = False
+                self.drag_pinch_start = 0.0
+
+        # ── Right Click ───────────────────────────────────────────────────────
+        if (right_dist < Config.CLICK_THRESHOLD
+                and not pinching
+                and (now - self.last_right_click) > Config.CLICK_COOLDOWN):
             pyautogui.rightClick()
             self.last_right_click  = now
             self.click_flash_type  = "RIGHT"
@@ -707,10 +1106,12 @@ class GestureController:
 
         # ── Compute target volume from distance (only when active) ────────────
         if self.vol_active:
-            # Map smoothed distance → 0–100% range
+            # Map from VOL_MIN_DIST (tight pinch = 0%) to VOL_MAX_DIST (spread = 100%)
+            # Using VOL_MIN_DIST as anchor — NOT VOL_ACTIVATE_DIST — so the full
+            # 0–100% range is reachable across the natural finger spread distance
             raw_pct = np.interp(
                 distance,
-                [Config.VOL_ACTIVATE_DIST, Config.VOL_MAX_DIST],
+                [Config.VOL_MIN_DIST, Config.VOL_MAX_DIST],
                 [0, 100]
             )
             # set_volume_percent updates vol_ctrl.current_pct internally
@@ -810,6 +1211,7 @@ def main():
     # ── Controllers ───────────────────────────────────────────────────────────
     controller = GestureController()
     ui         = UIRenderer(actual_w, actual_h)
+    show_guide = False   # Toggle with H key
 
     # ── FPS tracking ──────────────────────────────────────────────────────────
     fps_prev_time = time.time()
@@ -818,68 +1220,84 @@ def main():
     # ─────────────────────────────────────────────────────────────────────────
     #  MAIN LOOP
     # ─────────────────────────────────────────────────────────────────────────
-    while True:
-        success, frame = cap.read()
-        if not success:
-            print("[WARNING] Failed to read frame. Retrying...")
-            continue
+    try:
+        while True:
+            success, frame = cap.read()
+            if not success:
+                print("[WARNING] Failed to read frame. Retrying...")
+                continue
 
-        # Flip for mirror-view
-        if Config.FLIP_CAMERA:
-            frame = cv2.flip(frame, 1)
+            # Flip for mirror-view
+            if Config.FLIP_CAMERA:
+                frame = cv2.flip(frame, 1)
 
-        # ── FPS calculation ───────────────────────────────────────────────────
-        now          = time.time()
-        fps          = 0.9 * fps + 0.1 * (1.0 / max(now - fps_prev_time, 1e-5))
-        fps_prev_time = now
+            # ── FPS calculation ───────────────────────────────────────────────────
+            now          = time.time()
+            fps          = 0.9 * fps + 0.1 * (1.0 / max(now - fps_prev_time, 1e-5))
+            fps_prev_time = now
 
-        # ── Hand detection ────────────────────────────────────────────────────
-        rgb_frame    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb_frame.flags.writeable = False
-        results      = hands.process(rgb_frame)
-        rgb_frame.flags.writeable = True
+            # ── Hand detection ────────────────────────────────────────────────────
+            rgb_frame    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb_frame.flags.writeable = False
+            results      = hands.process(rgb_frame)
+            rgb_frame.flags.writeable = True
 
-        hand_detected = results.multi_hand_landmarks is not None
+            hand_detected = results.multi_hand_landmarks is not None
 
-        if hand_detected:
-            for hand_lms in results.multi_hand_landmarks:
-                # Draw skeletal overlay
-                mp_draw.draw_landmarks(
-                    frame, hand_lms,
-                    mp_hands.HAND_CONNECTIONS,
-                    mp_styles.get_default_hand_landmarks_style(),
-                    mp_styles.get_default_hand_connections_style(),
-                )
-                # Process gestures
-                controller.process_frame(frame, hand_lms, actual_w, actual_h, ui)
-        else:
-            controller.gesture_label = "No Hand Detected"
+            if hand_detected:
+                for hand_lms in results.multi_hand_landmarks:
+                    # Draw skeletal overlay
+                    mp_draw.draw_landmarks(
+                        frame, hand_lms,
+                        mp_hands.HAND_CONNECTIONS,
+                        mp_styles.get_default_hand_landmarks_style(),
+                        mp_styles.get_default_hand_connections_style(),
+                    )
+                    # Process gestures
+                    controller.process_frame(frame, hand_lms, actual_w, actual_h, ui)
+            else:
+                controller.gesture_label = "No Hand Detected"
 
-        # ── Draw UI ───────────────────────────────────────────────────────────
-        ui.draw_active_zone(frame)
-        ui.draw_info_panel(frame, fps, controller.mode, controller.gesture_label)
-        ui.draw_volume_bar(frame, controller.volume_pct, controller.vol_active)
-        ui.draw_help_strip(frame)
+            # ── Draw UI ───────────────────────────────────────────────────────────
+            ui.draw_active_zone(frame)
+            ui.draw_info_panel(frame, fps, controller.mode, controller.gesture_label)
+            ui.draw_volume_bar(frame, controller.volume_pct, controller.vol_active)
+            ui.draw_help_strip(frame)
 
-        # Click flash feedback
-        if time.time() < controller.click_flash_until:
-            ui.draw_click_flash(frame, controller.click_flash_type)
+            # Click flash feedback
+            if time.time() < controller.click_flash_until:
+                ui.draw_click_flash(frame, controller.click_flash_type)
 
-        # Mode switch flash
-        if time.time() < controller.mode_flash_until:
-            ui.draw_mode_switch_flash(frame, controller.mode_flash_label)
+            # Screenshot flash feedback
+            if time.time() < controller.screenshot_flash_until:
+                ui.draw_screenshot_flash(frame, controller.screenshot_last_name)
 
-        # ── Show frame ────────────────────────────────────────────────────────
-        cv2.imshow("Gesture Control System", frame)
+            # Mode switch flash
+            if time.time() < controller.mode_flash_until:
+                ui.draw_mode_switch_flash(frame, controller.mode_flash_label)
 
-        # ── Key handling ──────────────────────────────────────────────────────
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q') or key == ord('Q'):
-            print("[INFO]  Quit signal received. Exiting...")
-            break
-        elif key == ord('m') or key == ord('M'):
-            # Manual mode switch with 'M' key as backup
-            controller.switch_mode()
+            # On-screen gesture guide overlay (press H to toggle)
+            if show_guide:
+                ui.draw_gesture_guide(frame, controller.mode)
+
+            # ── Show frame ────────────────────────────────────────────────────────
+            cv2.imshow("Gesture Control System", frame)
+
+            # ── Key handling ──────────────────────────────────────────────────────
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == ord('Q'):
+                print("[INFO]  Quit signal received. Exiting...")
+                break
+            elif key == ord('m') or key == ord('M'):
+                controller.switch_mode()
+            elif key == ord('h') or key == ord('H'):
+                show_guide = not show_guide
+                print(f"[INFO]  Gesture guide {'shown' if show_guide else 'hidden'}")
+
+    except Exception as e:
+        print(f"[ERROR] Unexpected crash in main loop: {e}")
+        import traceback
+        traceback.print_exc()
 
     # ── Cleanup ───────────────────────────────────────────────────────────────
     cap.release()
